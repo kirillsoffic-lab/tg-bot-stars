@@ -14,7 +14,7 @@ from aiogram.types import Message
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # Ссылка на канал и контакт
-REFERRAL_LINK = "https://t.me/goggins"
+REFERRAL_LINK = "https://t.me/nftMETRO"
 PAYOUT_CONTACT = "@goatlyroony"
 
 # Проверка на всякий случай, чтобы не забыть добавить токен
