@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils import executor
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiohttp import web # Добавили библиотеку для "обмана" Render
 
 # --- НАСТРОЙКИ (Берутся из Render) ---
 TOKEN = os.getenv("BOT_TOKEN")
@@ -21,7 +22,7 @@ MANAGER_IDS = [x.strip() for x in managers_env.split(",")] if managers_env else 
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK")
 
-# Общий список персонала (для уведомлений и доступа к /check)
+# Общий список персонала
 STAFF_IDS = ADMIN_IDS + MANAGER_IDS
 
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +57,6 @@ def add_user(user_id, referrer_id=None, username=None):
     return False
 
 def count_referral(referrer_id):
-    # Начисляем только если юзер не забанен
     cursor.execute("UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ? AND is_banned = 0", (referrer_id,))
     conn.commit()
 
@@ -66,7 +66,6 @@ def get_user_data(user_id):
 def get_all_users():
     return cursor.execute("SELECT user_id FROM users").fetchall()
 
-# --- ПРОВЕРКИ ---
 async def check_sub(user_id):
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
@@ -76,6 +75,28 @@ async def check_sub(user_id):
         return False 
     return False
 
+# --- "ОБМАНКА" ДЛЯ RENDER (Keep Alive) ---
+async def health_check(request):
+    return web.Response(text="Bot is alive!")
+
+async def start_web_server():
+    # Создаем мини-сайт
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render сам дает порт через переменную PORT
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Web server started on port {port}")
+
+# Запускаем веб-сервер вместе с ботом
+async def on_startup(dp):
+    await start_web_server()
+    # Здесь можно добавить уведомление админу о запуске
+    # await bot.send_message(ADMIN_IDS[0], "Бот перезапущен!")
+
 # --- ОБРАБОТЧИКИ ---
 
 @dp.message_handler(commands=['start'])
@@ -83,9 +104,8 @@ async def start_command(message: types.Message):
     user_id = message.from_user.id
     username = message.from_user.username
     
-    # Проверка на бан
     user_data = get_user_data(user_id)
-    if user_data and user_data[1] == 1: # is_banned == 1
+    if user_data and user_data[1] == 1: 
         await message.answer("⛔️ **Ваш аккаунт заблокирован администрацией.**")
         return
 
@@ -132,8 +152,6 @@ async def show_main_menu(message: types.Message):
 
     await message.answer(msg_text, reply_markup=keyboard, parse_mode="Markdown")
 
-# --- КНОПКИ ---
-
 @dp.callback_query_handler(lambda c: c.data.startswith('check_sub_'))
 async def process_sub_check(callback_query: types.CallbackQuery):
     referrer_id = int(callback_query.data.split('_')[2])
@@ -171,11 +189,9 @@ async def withdraw_request(callback: types.CallbackQuery):
         await callback.answer("❌ Мало рефералов!", show_alert=True)
         return
 
-    # Уведомляем персонал
     if STAFF_IDS:
         for staff_id in STAFF_IDS:
             try:
-                # Разный текст для Админа и Менеджера
                 if str(staff_id) in ADMIN_IDS:
                     actions = (f"🔎 Чек: `/check {user_id}`\n"
                                f"💬 ЛС: `/pm {user_id} Текст`\n"
@@ -198,26 +214,19 @@ async def withdraw_request(callback: types.CallbackQuery):
         await callback.message.answer("✅ **Заявка отправлена!** Ожидайте.")
         await callback.message.delete()
 
-# --- КОМАНДЫ ПЕРСОНАЛА (МЕНЕДЖЕР + АДМИН) ---
-
 @dp.message_handler(commands=['check'])
 async def check_user(message: types.Message):
-    # Доступно и Админу, и Менеджеру
     if str(message.from_user.id) not in STAFF_IDS: return
-
     try: target_id = int(message.get_args())
     except: 
         await message.answer("⚠️ Пиши: `/check ID`")
         return
-
     data = get_user_data(target_id)
     if not data:
         await message.answer("❌ Нет такого юзера.")
         return
-
     refs = cursor.execute("SELECT user_id, username FROM users WHERE referrer_id = ? ORDER BY user_id DESC LIMIT 5", (target_id,)).fetchall()
     ref_text = "\n".join([f"- {r[1] if r[1] else 'Без ника'} (ID {r[0]})" for r in refs])
-
     await message.answer(
         f"🕵️‍♂️ **Досье на {target_id}**\n"
         f"Баланс: {data[0]}\n"
@@ -227,9 +236,7 @@ async def check_user(message: types.Message):
 
 @dp.message_handler(commands=['pm'])
 async def pm_user(message: types.Message):
-    # Доступно и Админу, и Менеджеру
     if str(message.from_user.id) not in STAFF_IDS: return
-
     try:
         args = message.get_args().split(maxsplit=1)
         target_id = int(args[0])
@@ -237,7 +244,6 @@ async def pm_user(message: types.Message):
     except:
         await message.answer("⚠️ Пиши: `/pm ID Текст`")
         return
-
     try:
         await bot.send_message(target_id, f"📨 **Сообщение от поддержки:**\n\n{text}")
         await message.answer(f"✅ Сообщение отправлено.")
@@ -246,24 +252,17 @@ async def pm_user(message: types.Message):
 
 @dp.message_handler(commands=['top'])
 async def top_users(message: types.Message):
-    # Доступно и Админу, и Менеджеру
     if str(message.from_user.id) not in STAFF_IDS: return 
-
     top_players = cursor.execute("SELECT user_id, referrals_count, username FROM users ORDER BY referrals_count DESC LIMIT 10").fetchall()
     top_text = "🏆 **ТОП-10 ЛИДЕРОВ:**\n"
     for index, player in enumerate(top_players):
         uname = player[2] if player[2] else f"ID {player[0]}"
         top_text += f"{index+1}. @{uname} — **{player[1]}**\n"
-
     await message.answer(top_text, parse_mode="Markdown")
-
-# --- ОПАСНЫЕ КОМАНДЫ (ТОЛЬКО ВЛАДЕЛЬЦА) ---
 
 @dp.message_handler(commands=['set'])
 async def set_balance(message: types.Message):
-    # ТОЛЬКО АДМИН (Владелец)
     if str(message.from_user.id) not in ADMIN_IDS: return
-
     try:
         args = message.get_args().split()
         target_id = int(args[0])
@@ -271,34 +270,27 @@ async def set_balance(message: types.Message):
     except:
         await message.answer("⚠️ `/set ID Сумма`")
         return
-
     cursor.execute("UPDATE users SET referrals_count = ? WHERE user_id = ?", (amount, target_id))
     conn.commit()
     await message.answer(f"✅ Баланс {target_id} = {amount}")
 
 @dp.message_handler(commands=['ban'])
 async def ban_user(message: types.Message):
-    # ТОЛЬКО АДМИН (Владелец)
     if str(message.from_user.id) not in ADMIN_IDS: return
-
     try: target_id = int(message.get_args())
     except: return
-
     cursor.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_id,))
     conn.commit()
     await message.answer(f"⛔️ Юзер {target_id} ЗАБАНЕН!")
 
 @dp.message_handler(commands=['admin'])
 async def admin_panel(message: types.Message):
-    # ТОЛЬКО АДМИН (Владелец)
     if str(message.from_user.id) not in ADMIN_IDS: return
-    
     users = get_all_users()
     await message.answer(f"👑 **ВЛАДЕЛЕЦ**\nПользователей: {len(users)}\n\n`/send Текст` - Рассылка\n`/set` - Менять баланс\n`/ban` - Банить")
 
 @dp.message_handler(commands=['send'])
 async def admin_send(message: types.Message):
-    # ТОЛЬКО АДМИН (Владелец)
     if str(message.from_user.id) not in ADMIN_IDS: return
     text = message.get_args()
     if not text: return
@@ -310,4 +302,5 @@ async def admin_send(message: types.Message):
     await message.answer("✅ Готово.")
 
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+    # ВАЖНО: Добавили on_startup=on_startup, чтобы запустить "сайт-обманку"
+    executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
