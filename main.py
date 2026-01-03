@@ -10,131 +10,129 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # --- НАСТРОЙКИ (Берутся из Render) ---
 TOKEN = os.getenv("BOT_TOKEN")
 
-# Получаем список админов (разделенных запятой)
+# Владелец (может ВСЁ: бан, баланс, рассылка)
 admins_env = os.getenv("ADMIN_ID", "")
 ADMIN_IDS = [x.strip() for x in admins_env.split(",")] if admins_env else []
 
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # ID канала (с минусом)
-CHANNEL_LINK = os.getenv("CHANNEL_LINK") # Ссылка на канал
+# Менеджеры (могут только проверять и писать)
+managers_env = os.getenv("MANAGER_IDS", "")
+MANAGER_IDS = [x.strip() for x in managers_env.split(",")] if managers_env else []
 
-# Включаем логирование
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+CHANNEL_LINK = os.getenv("CHANNEL_LINK")
+
+# Общий список персонала (для уведомлений и доступа к /check)
+STAFF_IDS = ADMIN_IDS + MANAGER_IDS
+
 logging.basicConfig(level=logging.INFO)
 
-# Инициализация бота и БД
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot, storage=MemoryStorage())
 conn = sqlite3.connect('database.db')
 cursor = conn.cursor()
 
-# Создаем таблицу пользователей
+# Создаем таблицу
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     referrer_id INTEGER,
-    referrals_count INTEGER DEFAULT 0
+    referrals_count INTEGER DEFAULT 0,
+    username TEXT,
+    is_banned INTEGER DEFAULT 0
 )
 """)
 conn.commit()
 
-# --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
+# --- ФУНКЦИИ БАЗЫ ---
 def user_exists(user_id):
     result = cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,)).fetchone()
     return bool(result)
 
-def add_user(user_id, referrer_id=None):
+def add_user(user_id, referrer_id=None, username=None):
     if not user_exists(user_id):
-        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-        if cursor.fetchone() is None:
-            cursor.execute("INSERT INTO users (user_id, referrer_id, referrals_count) VALUES (?, ?, 0)", (user_id, referrer_id))
-            conn.commit()
-            return True
+        cursor.execute("INSERT INTO users (user_id, referrer_id, referrals_count, username, is_banned) VALUES (?, ?, 0, ?, 0)", (user_id, referrer_id, username))
+        conn.commit()
+        return True
     return False
 
 def count_referral(referrer_id):
-    cursor.execute("UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ?", (referrer_id,))
+    # Начисляем только если юзер не забанен
+    cursor.execute("UPDATE users SET referrals_count = referrals_count + 1 WHERE user_id = ? AND is_banned = 0", (referrer_id,))
     conn.commit()
 
-def get_referrals_count(user_id):
-    result = cursor.execute("SELECT referrals_count FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    return result[0] if result else 0
+def get_user_data(user_id):
+    return cursor.execute("SELECT referrals_count, is_banned, username FROM users WHERE user_id = ?", (user_id,)).fetchone()
 
 def get_all_users():
     return cursor.execute("SELECT user_id FROM users").fetchall()
 
-# --- ПРОВЕРКА ПОДПИСКИ ---
+# --- ПРОВЕРКИ ---
 async def check_sub(user_id):
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
         if member.status in ['creator', 'administrator', 'member']:
             return True
-    except Exception as e:
-        logging.error(f"Ошибка проверки подписки: {e}")
-        # Если бот не админ или ошибка, лучше вернуть True чтобы не блокировать всех
+    except:
         return False 
     return False
 
-# --- ОБРАБОТЧИКИ (HANDLERS) ---
+# --- ОБРАБОТЧИКИ ---
 
 @dp.message_handler(commands=['start'])
 async def start_command(message: types.Message):
     user_id = message.from_user.id
+    username = message.from_user.username
     
+    # Проверка на бан
+    user_data = get_user_data(user_id)
+    if user_data and user_data[1] == 1: # is_banned == 1
+        await message.answer("⛔️ **Ваш аккаунт заблокирован администрацией.**")
+        return
+
     args = message.get_args()
     referrer_id = int(args) if args and args.isdigit() and int(args) != user_id else None
 
-    # 1. Проверяем подписку
-    is_subscribed = await check_sub(user_id)
-    
-    if not is_subscribed:
+    if not await check_sub(user_id):
         keyboard = InlineKeyboardMarkup()
         keyboard.add(InlineKeyboardButton(text="👉 Подписаться на канал", url=CHANNEL_LINK))
         keyboard.add(InlineKeyboardButton(text="✅ Я подписался", callback_data=f"check_sub_{referrer_id if referrer_id else 0}"))
-        
-        await message.answer(
-            f"👋 Привет, {message.from_user.first_name}!\n\n"
-            f"⛔️ **Доступ закрыт!**\n"
-            f"Чтобы начать зарабатывать Звезды, ты должен быть подписан на наш главный канал.",
-            reply_markup=keyboard,
-            parse_mode="Markdown"
-        )
+        await message.answer(f"👋 Привет! Подпишись на канал, чтобы начать.", reply_markup=keyboard)
         return
 
-    # 2. Регистрируем
     if not user_exists(user_id):
-        add_user(user_id, referrer_id)
-        if referrer_id and user_exists(referrer_id):
+        add_user(user_id, referrer_id, username)
+        if referrer_id:
             count_referral(referrer_id)
-            try:
-                await bot.send_message(referrer_id, f"🎉 У тебя новый реферал: {message.from_user.first_name}!")
-            except:
-                pass
+            try: await bot.send_message(referrer_id, f"🎉 У тебя новый реферал: {message.from_user.first_name}!")
+            except: pass
 
-    # 3. Меню
     await show_main_menu(message)
 
 async def show_main_menu(message: types.Message):
     user_id = message.from_user.id
-    username = (await bot.get_me()).username
-    ref_link = f"https://t.me/{username}?start={user_id}"
+    data = get_user_data(user_id)
+    if not data: return 
+    
+    count = data[0]
+    me = await bot.get_me()
+    ref_link = f"https://t.me/{me.username}?start={user_id}"
     
     msg_text = (
-        f"🌟 **Roony Stars Bot**\n\n"
-        f"Твоя задача: приглашать друзей и получать Звезды.\n\n"
-        f"🔗 **Твоя личная ссылка:**\n`{ref_link}`\n\n"
-        f"📊 Приглашено: **{get_referrals_count(user_id)} чел.**\n"
+        f"🌟 **Roony Stars**\n\n"
+        f"🔗 **Твоя ссылка:**\n`{ref_link}`\n\n"
+        f"📊 Приглашено: **{count} чел.**\n"
         f"💰 Оплата: 1 друг = 1 ⭐\n"
-        f"💳 Минимальный вывод: 15 ⭐"
+        f"💳 Вывод от: 15 ⭐"
     )
     
     keyboard = InlineKeyboardMarkup()
-    if get_referrals_count(user_id) >= 15:
+    if count >= 15:
         keyboard.add(InlineKeyboardButton(text="💰 ЗАПРОСИТЬ ВЫВОД 💰", callback_data="withdraw_money"))
-    
-    keyboard.add(InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="refresh_profile"))
+    keyboard.add(InlineKeyboardButton(text="🔄 Обновить", callback_data="refresh_profile"))
 
     await message.answer(msg_text, reply_markup=keyboard, parse_mode="Markdown")
 
-# --- CALLBACKS ---
+# --- КНОПКИ ---
 
 @dp.callback_query_handler(lambda c: c.data.startswith('check_sub_'))
 async def process_sub_check(callback_query: types.CallbackQuery):
@@ -145,120 +143,171 @@ async def process_sub_check(callback_query: types.CallbackQuery):
         await callback_query.message.delete()
         msg = callback_query.message
         msg.from_user = callback_query.from_user
-        
-        # Регистрируем
         if not user_exists(callback_query.from_user.id):
-             add_user(callback_query.from_user.id, referrer_id)
-             if referrer_id and user_exists(referrer_id):
-                 count_referral(referrer_id)
-                 try:
-                    await bot.send_message(referrer_id, "🎉 У тебя новый реферал!")
-                 except: pass
-        
+             add_user(callback_query.from_user.id, referrer_id, callback_query.from_user.username)
+             if referrer_id: count_referral(referrer_id)
         await show_main_menu(msg)
     else:
-        await callback_query.answer("❌ Ты еще не подписался!", show_alert=True)
+        await callback_query.answer("❌ Сначала подписка!", show_alert=True)
 
 @dp.callback_query_handler(text="refresh_profile")
 async def refresh_profile(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    count = get_referrals_count(user_id)
-    
-    keyboard = InlineKeyboardMarkup()
-    if count >= 15:
-        keyboard.add(InlineKeyboardButton(text="💰 ЗАПРОСИТЬ ВЫВОД 💰", callback_data="withdraw_money"))
-    keyboard.add(InlineKeyboardButton(text="🔄 Обновить статистику", callback_data="refresh_profile"))
-    
-    ref_link = f"https://t.me/{(await bot.get_me()).username}?start={user_id}"
-    new_text = (
-        f"🌟 **Roony Stars Bot**\n\n"
-        f"🔗 **Твоя личная ссылка:**\n`{ref_link}`\n\n"
-        f"📊 Приглашено: **{count} чел.**\n"
-        f"💰 Оплата: 1 друг = 1 ⭐\n"
-        f"💳 Минимальный вывод: 15 ⭐"
-    )
-    
     try:
-        await callback.message.edit_text(new_text, reply_markup=keyboard, parse_mode="Markdown")
-    except:
-        pass 
-    await callback.answer()
+        await show_main_menu(callback.message)
+        await callback.message.delete()
+    except: pass
 
 @dp.callback_query_handler(text="withdraw_money")
 async def withdraw_request(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    username = callback.from_user.username
-    count = get_referrals_count(user_id)
+    data = get_user_data(user_id)
+    
+    if not data or data[1] == 1: 
+         await callback.answer("⛔️ Вы заблокированы!", show_alert=True)
+         return
 
+    count = data[0]
     if count < 15:
-        await callback.answer("❌ Недостаточно рефералов!", show_alert=True)
+        await callback.answer("❌ Мало рефералов!", show_alert=True)
         return
 
-    # Отправляем уведомление ВСЕМ АДМИНАМ
-    if ADMIN_IDS:
-        for admin_id in ADMIN_IDS:
+    # Уведомляем персонал
+    if STAFF_IDS:
+        for staff_id in STAFF_IDS:
             try:
+                # Разный текст для Админа и Менеджера
+                if str(staff_id) in ADMIN_IDS:
+                    actions = (f"🔎 Чек: `/check {user_id}`\n"
+                               f"💬 ЛС: `/pm {user_id} Текст`\n"
+                               f"⛔️ БАН: `/ban {user_id}`\n"
+                               f"✏️ СЕТ: `/set {user_id} 0`")
+                else:
+                    actions = (f"🔎 Чек: `/check {user_id}`\n"
+                               f"💬 ЛС: `/pm {user_id} Текст`\n"
+                               f"⚠️ Если накрутка — пиши Админу!")
+
                 await bot.send_message(
-                    admin_id, 
-                    f"🚨 **ЗАЯВКА НА ВЫВОД** 🚨\n\n"
-                    f"👤 Юзер: @{username} (ID: {user_id})\n"
-                    f"👥 Рефералов: {count}\n"
-                    f"💵 К оплате: {count} звезд\n\n"
-                    f"👉 Проверь его и свяжись!"
+                    staff_id, 
+                    f"🚨 **ЗАЯВКА НА ВЫВОД**\n"
+                    f"👤 Юзер: @{callback.from_user.username} (ID: `{user_id}`)\n"
+                    f"💰 Сумма: {count} звезд\n\n"
+                    f"{actions}",
+                    parse_mode="Markdown"
                 )
-            except Exception as e:
-                logging.error(f"Не удалось отправить админу {admin_id}: {e}")
-        
-        await callback.message.answer("✅ **Заявка отправлена менеджеру!**\nОжидайте проверки в течение 24 часов.")
+            except: pass
+        await callback.message.answer("✅ **Заявка отправлена!** Ожидайте.")
         await callback.message.delete()
-    else:
-        await callback.answer("Ошибка настройки админов.", show_alert=True)
 
-# --- АДМИНСКИЕ КОМАНДЫ ---
+# --- КОМАНДЫ ПЕРСОНАЛА (МЕНЕДЖЕР + АДМИН) ---
 
-@dp.message_handler(commands=['admin'])
-async def admin_stats(message: types.Message):
-    # Проверка: есть ли ID пользователя в списке админов
-    if str(message.from_user.id) not in ADMIN_IDS:
-        return 
+@dp.message_handler(commands=['check'])
+async def check_user(message: types.Message):
+    # Доступно и Админу, и Менеджеру
+    if str(message.from_user.id) not in STAFF_IDS: return
 
-    users = get_all_users()
-    count_users = len(users)
-    
-    cursor.execute("SELECT COUNT(*) FROM users WHERE referrals_count > 0")
-    active_users = cursor.fetchone()[0]
+    try: target_id = int(message.get_args())
+    except: 
+        await message.answer("⚠️ Пиши: `/check ID`")
+        return
+
+    data = get_user_data(target_id)
+    if not data:
+        await message.answer("❌ Нет такого юзера.")
+        return
+
+    refs = cursor.execute("SELECT user_id, username FROM users WHERE referrer_id = ? ORDER BY user_id DESC LIMIT 5", (target_id,)).fetchall()
+    ref_text = "\n".join([f"- {r[1] if r[1] else 'Без ника'} (ID {r[0]})" for r in refs])
 
     await message.answer(
-        f"👮‍♂️ **Админ-Панель**\n\n"
-        f"👥 Всего пользователей: **{count_users}**\n"
-        f"⚡️ Приводили друзей: **{active_users}**\n\n"
-        f"Для рассылки пиши: `/send Текст сообщения`",
-        parse_mode="Markdown"
+        f"🕵️‍♂️ **Досье на {target_id}**\n"
+        f"Баланс: {data[0]}\n"
+        f"Бан: {'ДА' if data[1] else 'НЕТ'}\n\n"
+        f"👥 **Последние 5:**\n{ref_text if ref_text else 'Пусто'}"
     )
 
-@dp.message_handler(commands=['send'])
-async def admin_broadcast(message: types.Message):
-    if str(message.from_user.id) not in ADMIN_IDS:
+@dp.message_handler(commands=['pm'])
+async def pm_user(message: types.Message):
+    # Доступно и Админу, и Менеджеру
+    if str(message.from_user.id) not in STAFF_IDS: return
+
+    try:
+        args = message.get_args().split(maxsplit=1)
+        target_id = int(args[0])
+        text = args[1]
+    except:
+        await message.answer("⚠️ Пиши: `/pm ID Текст`")
         return
 
-    text = message.get_args()
-    if not text:
-        await message.answer("❌ Введи текст рассылки!\nПример: `/send Всем привет!`")
+    try:
+        await bot.send_message(target_id, f"📨 **Сообщение от поддержки:**\n\n{text}")
+        await message.answer(f"✅ Сообщение отправлено.")
+    except:
+        await message.answer("❌ Юзер заблокировал бота.")
+
+@dp.message_handler(commands=['top'])
+async def top_users(message: types.Message):
+    # Доступно и Админу, и Менеджеру
+    if str(message.from_user.id) not in STAFF_IDS: return 
+
+    top_players = cursor.execute("SELECT user_id, referrals_count, username FROM users ORDER BY referrals_count DESC LIMIT 10").fetchall()
+    top_text = "🏆 **ТОП-10 ЛИДЕРОВ:**\n"
+    for index, player in enumerate(top_players):
+        uname = player[2] if player[2] else f"ID {player[0]}"
+        top_text += f"{index+1}. @{uname} — **{player[1]}**\n"
+
+    await message.answer(top_text, parse_mode="Markdown")
+
+# --- ОПАСНЫЕ КОМАНДЫ (ТОЛЬКО ВЛАДЕЛЬЦА) ---
+
+@dp.message_handler(commands=['set'])
+async def set_balance(message: types.Message):
+    # ТОЛЬКО АДМИН (Владелец)
+    if str(message.from_user.id) not in ADMIN_IDS: return
+
+    try:
+        args = message.get_args().split()
+        target_id = int(args[0])
+        amount = int(args[1])
+    except:
+        await message.answer("⚠️ `/set ID Сумма`")
         return
 
+    cursor.execute("UPDATE users SET referrals_count = ? WHERE user_id = ?", (amount, target_id))
+    conn.commit()
+    await message.answer(f"✅ Баланс {target_id} = {amount}")
+
+@dp.message_handler(commands=['ban'])
+async def ban_user(message: types.Message):
+    # ТОЛЬКО АДМИН (Владелец)
+    if str(message.from_user.id) not in ADMIN_IDS: return
+
+    try: target_id = int(message.get_args())
+    except: return
+
+    cursor.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_id,))
+    conn.commit()
+    await message.answer(f"⛔️ Юзер {target_id} ЗАБАНЕН!")
+
+@dp.message_handler(commands=['admin'])
+async def admin_panel(message: types.Message):
+    # ТОЛЬКО АДМИН (Владелец)
+    if str(message.from_user.id) not in ADMIN_IDS: return
+    
     users = get_all_users()
-    await message.answer(f"📢 Начинаю рассылку на {len(users)} человек...")
-    
-    count = 0
-    for user in users:
-        try:
-            await bot.send_message(user[0], f"📢 **НОВОСТИ ROONY STARS**\n\n{text}", parse_mode="Markdown")
-            count += 1
-            await asyncio.sleep(0.1) 
-        except:
-            pass 
-    
-    await message.answer(f"✅ Рассылка завершена! Доставлено: {count}")
+    await message.answer(f"👑 **ВЛАДЕЛЕЦ**\nПользователей: {len(users)}\n\n`/send Текст` - Рассылка\n`/set` - Менять баланс\n`/ban` - Банить")
+
+@dp.message_handler(commands=['send'])
+async def admin_send(message: types.Message):
+    # ТОЛЬКО АДМИН (Владелец)
+    if str(message.from_user.id) not in ADMIN_IDS: return
+    text = message.get_args()
+    if not text: return
+    users = get_all_users()
+    await message.answer(f"🚀 Рассылка...")
+    for u in users:
+        try: await bot.send_message(u[0], text)
+        except: pass
+    await message.answer("✅ Готово.")
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
