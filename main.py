@@ -6,16 +6,16 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.utils import executor
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiohttp import web # Добавили библиотеку для "обмана" Render
+from aiohttp import web 
 
 # --- НАСТРОЙКИ (Берутся из Render) ---
 TOKEN = os.getenv("BOT_TOKEN")
 
-# Владелец (может ВСЁ: бан, баланс, рассылка)
+# Владелец
 admins_env = os.getenv("ADMIN_ID", "")
 ADMIN_IDS = [x.strip() for x in admins_env.split(",")] if admins_env else []
 
-# Менеджеры (могут только проверять и писать)
+# Менеджеры
 managers_env = os.getenv("MANAGER_IDS", "")
 MANAGER_IDS = [x.strip() for x in managers_env.split(",")] if managers_env else []
 
@@ -80,22 +80,17 @@ async def health_check(request):
     return web.Response(text="Bot is alive!")
 
 async def start_web_server():
-    # Создаем мини-сайт
     app = web.Application()
     app.router.add_get('/', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render сам дает порт через переменную PORT
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logging.info(f"Web server started on port {port}")
+    logging.info(f"Web server started on port {port}") # <--- ВОТ ЭТА СТРОЧКА ПОЯВИТСЯ В ЛОГАХ
 
-# Запускаем веб-сервер вместе с ботом
 async def on_startup(dp):
     await start_web_server()
-    # Здесь можно добавить уведомление админу о запуске
-    # await bot.send_message(ADMIN_IDS[0], "Бот перезапущен!")
 
 # --- ОБРАБОТЧИКИ ---
 
@@ -302,5 +297,4 @@ async def admin_send(message: types.Message):
     await message.answer("✅ Готово.")
 
 if __name__ == '__main__':
-    # ВАЖНО: Добавили on_startup=on_startup, чтобы запустить "сайт-обманку"
     executor.start_polling(dp, skip_updates=True, on_startup=on_startup)
